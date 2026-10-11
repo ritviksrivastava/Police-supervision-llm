@@ -1,0 +1,56 @@
+{
+  "_comment": "One record per supervision note (पर्यवेक्षण टिप्पणी). All text is Unicode Devanagari after Kruti Dev conversion. Sections absent from a note are null.",
+  "record": {
+    "doc_id": "string — stable hash of file content",
+    "source_file": "string — path under data/raw",
+    "doc_type": "supervision_note | progress_report | final_report | report_2",
+    "issuing_office": "string — e.g. अनुमंडल पुलिस पदाधिकारी, बाघमारा",
+    "case": {
+      "police_station": "string",
+      "case_no": "integer",
+      "case_year": "integer",
+      "case_date": "YYYY-MM-DD",
+      "sections_of_law": ["string — e.g. 126(2) BNS"],
+      "acts": ["string — BNS / IPC / Arms Act / ..."]
+    },
+    "header": {
+      "place_of_occurrence": "string",
+      "direction_distance_from_ps": "string",
+      "occurrence_datetime": "string",
+      "fir_datetime": "string",
+      "io_arrival_date": "string",
+      "supervision_date": "string",
+      "investigating_officer": "string",
+      "supervising_officer": "string"
+    },
+    "input_sections": {
+      "fir": "प्राथमिकी — who complained, against whom, the allegation",
+      "place": "घटनास्थल — description and boundaries of the scene",
+      "prosecution_evidence": "अभियोजन साक्ष्य — complainant's statement",
+      "witnesses": ["साक्षी — one entry per witness statement"],
+      "investigation_progress": "अनुसंधान में प्रगति",
+      "arrest": "गिरफ्तारी",
+      "surrender": "समर्पण",
+      "search_seizure": "तलाशी / जप्ती सूची",
+      "defence_evidence": "प्रतिरक्षा साक्ष्य"
+    },
+    "output_sections": {
+      "conclusion": "निष्कर्ष — case summary and finding (true / false / under which sections, against whom)",
+      "lapses": "त्रुटि — lapses by the investigating officer",
+      "directions": ["निर्देश — one entry per direction to the investigating officer"]
+    },
+    "footer": {
+      "accused_summary": "अभियुक्त विवरणी — counts: FIR-named, arrested, absconding, bail",
+      "case_diary_no": "string",
+      "case_diary_date": "string"
+    },
+    "linked_report_2": "doc_id of the SP-office Report-2 for the same case, or null"
+  },
+  "training_example": {
+    "messages": [
+      {"role": "system", "content": "आप एक पर्यवेक्षण पदाधिकारी हैं। दिए गए कांड विवरण के आधार पर निष्कर्ष, त्रुटि एवं अनुसंधानकर्ता को निर्देश लिखें।"},
+      {"role": "user", "content": "<case line + header fields + input_sections, each under its Hindi heading, in document order>"},
+      {"role": "assistant", "content": "निष्कर्ष :- ...\n\nत्रुटि :- ...\n\nनिर्देश :-\n(क) ...\n(ख) ..."}
+    ]
+  }
+}

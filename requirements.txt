@@ -1,0 +1,9 @@
+lxml
+torch
+transformers
+peft
+accelerate
+# Qwen 3.5 only - optimised kernels (see README section 3.2):
+# flash-linear-attention
+# causal-conv1d   (pip install --no-build-isolation causal-conv1d)
+# bitsandbytes    (only for --load-4bit)

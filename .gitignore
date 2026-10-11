@@ -1,0 +1,23 @@
+# Never commit case documents, datasets, model outputs or weights
+*.jsonl
+*.csv
+*.zip
+*.docx
+*.doc
+*.pdf
+data/
+dataset/
+report-2/
+runs/
+*.log
+
+# machine-specific helper (hard-codes a host address)
+queue_on_*.ps1
+
+__pycache__/
+*.pyc
+.venv/
+
+# machine-specific run wrappers (kept locally and on the training machine)
+run_when_free.sh
+resume_on_boot.sh
