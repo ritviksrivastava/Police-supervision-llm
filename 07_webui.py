@@ -7,14 +7,16 @@ Run
   python 07_webui.py serve --adapter ../runs/qwen35-4b-sn/merged --vllm-url http://127.0.0.1:8000   # many users
 Options: --host 127.0.0.1 --port 7860 --max-new-tokens 4096 --root-path /supervision (behind a reverse proxy)
 
-Nothing typed into the form is written to disk or logged; only timings are printed.
+Nothing typed into the form is logged; only timings are printed. A report the user asks to download is written to a
+private temporary folder and deleted after about 15 minutes.
 """
-import argparse, getpass, hashlib, hmac, importlib.util, json, os, re, secrets, sys, threading, time
+import argparse, getpass, hashlib, hmac, importlib.util, inspect, json, os, re, secrets, sys, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 USERS = os.path.join(HERE, "webui_users.json")
 sys.path.insert(0, HERE)
 from krutidev import kruti_to_unicode, looks_like_kruti  # noqa: E402
+import report  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("evaluate", os.path.join(HERE, "06_evaluate.py"))
 evaluate = importlib.util.module_from_spec(_spec)
@@ -232,7 +234,10 @@ class RemoteDrafter:
 
     def stream(self, prompt_text):
         """Yield the draft as it is written; closing the connection when the model loops makes vLLM drop the request."""
-        body = {"model": self.model, "prompt": prompt_text, "max_tokens": self.max_new_tokens, "temperature": 0,
+        # Send token ids, not text: the server's own tokeniser splits Hindi differently from the one used in training
+        # (about 50% more tokens), and the model then misspells words. With our ids the output matches transformers.
+        ids = self.tok(prompt_text, add_special_tokens=False)["input_ids"]
+        body = {"model": self.model, "prompt": ids, "max_tokens": self.max_new_tokens, "temperature": 0,
                 "stream": True, "skip_special_tokens": True}
         text = ""
         try:
@@ -292,32 +297,112 @@ def make_app(drafter):
               flush=True)
         yield converted + [parts.get("निष्कर्ष", ""), parts.get("त्रुटि", ""), dirs, note]
 
-    with gr.Blocks(title="पर्यवेक्षण टिप्पणी – मसौदा सहायक") as app:
-        gr.Markdown("## पर्यवेक्षण टिप्पणी – मसौदा सहायक\n"
-                    "कांड के विवरण भरें और **मसौदा तैयार करें** दबाएँ। मॉडल *निष्कर्ष*, *त्रुटि* एवं *निर्देश* का "
-                    "मसौदा लिखेगा। **यह केवल मसौदा है** – पर्यवेक्षण पदाधिकारी द्वारा जाँच एवं संशोधन आवश्यक है।")
+    def export(fmt, kruti, mark_draft, conclusion_text, lapses_text, directions_text, *values):
+        v = {key: to_unicode(val, kruti) for (key, *_), val in zip(ALL_FIELDS, values)}
+        if not (conclusion_text or "").strip():
+            return None, "⚠ पहले मसौदा तैयार करें (या निष्कर्ष लिखें), फिर रिपोर्ट बनाएँ।"
+        try:
+            path = report.make_report(fmt, build_case_facts(v), conclusion_text, lapses_text, directions_text,
+                                      v["supervisor"], mark_draft, v["case_no"])
+        except Exception as e:
+            print(f"report failed: {e!r}", flush=True)
+            return None, "⚠ रिपोर्ट बनाते समय त्रुटि हुई। कृपया पुनः प्रयास करें।"
+        return path, f"✅ {'Word' if fmt == 'docx' else 'PDF'} रिपोर्ट तैयार है – नीचे से डाउनलोड करें।"
+
+    blocks_kwargs = {"title": "पर्यवेक्षण टिप्पणी – मसौदा सहायक"}
+    if "delete_cache" in inspect.signature(gr.Blocks.__init__).parameters:
+        blocks_kwargs["delete_cache"] = (600, 900)      # downloaded reports leave Gradio's cache within ~15 minutes
+    with gr.Blocks(**blocks_kwargs) as app:
+        gr.HTML('<div class="sn-banner"><div class="sn-title">पर्यवेक्षण टिप्पणी – मसौदा सहायक</div>'
+                '<div class="sn-sub">कांड के विवरण भरें और <b>मसौदा तैयार करें</b> दबाएँ। मॉडल <b>निष्कर्ष</b>, '
+                '<b>त्रुटि</b> एवं <b>निर्देश</b> का मसौदा लिखेगा। यह केवल मसौदा है – पर्यवेक्षण पदाधिकारी द्वारा '
+                'जाँच एवं संशोधन आवश्यक है।</div></div>')
         boxes = {}
-        with gr.Row():
+        with gr.Row(equal_height=False):
             with gr.Column(scale=1):
-                kruti = gr.Checkbox(label="Kruti Dev फ़ॉन्ट में टाइप/पेस्ट किया गया पाठ (यूनिकोड में बदलें)", value=False)
-                with gr.Accordion("कांड का विवरण", open=True):
+                gr.HTML('<div class="sn-col-head sn-col-in">कांड का विवरण (इनपुट)</div>')
+                kruti = gr.Checkbox(label="Kruti Dev फ़ॉन्ट में टाइप/पेस्ट किया गया पाठ (यूनिकोड में बदलें)", value=False,
+                                    elem_classes=["sn-check"])
+                with gr.Accordion("कांड का विवरण", open=True, elem_classes=["sn-card", "c-case"]):
                     for key, label, lines, ph in CASE_FIELDS:
                         boxes[key] = gr.Textbox(label=label, lines=lines, placeholder=ph)
-                with gr.Accordion("अन्य विवरण (वैकल्पिक)", open=False):
+                with gr.Accordion("अन्य विवरण (वैकल्पिक)", open=False, elem_classes=["sn-card", "c-header"]):
                     for key, label, lines, ph in HEADER_FIELDS:
                         boxes[key] = gr.Textbox(label=label, lines=lines, placeholder=ph)
                 for key, label, lines, ph in SECTION_FIELDS:
-                    boxes[key] = gr.Textbox(label=label, lines=lines, placeholder=ph)
-                go = gr.Button("मसौदा तैयार करें", variant="primary")
+                    boxes[key] = gr.Textbox(label=label, lines=lines, placeholder=ph,
+                                            elem_classes=["sn-card", f"c-{SECTION_COLOURS.get(key, 'misc')}"])
+                go = gr.Button("मसौदा तैयार करें", variant="primary", elem_classes=["sn-go"])
             with gr.Column(scale=1):
-                status = gr.Markdown("")
-                conclusion = gr.Textbox(label="निष्कर्ष", lines=14, interactive=True)
-                lapses = gr.Textbox(label="त्रुटि", lines=3, interactive=True)
-                directions = gr.Textbox(label="निर्देश", lines=14, interactive=True)
+                gr.HTML('<div class="sn-col-head sn-col-out">मसौदा (आउटपुट)</div>')
+                status = gr.Markdown("", elem_classes=["sn-status"])
+                conclusion = gr.Textbox(label="निष्कर्ष", lines=14, interactive=True, elem_classes=["sn-card", "c-out1"])
+                lapses = gr.Textbox(label="त्रुटि", lines=3, interactive=True, elem_classes=["sn-card", "c-out2"])
+                directions = gr.Textbox(label="निर्देश", lines=14, interactive=True, elem_classes=["sn-card", "c-out3"])
+                with gr.Group(elem_classes=["sn-card", "c-report"]):
+                    gr.HTML('<div class="sn-report-head">पूर्ण पर्यवेक्षण टिप्पणी डाउनलोड करें</div>'
+                            '<div class="sn-report-sub">सभी इनपुट अनुभाग तथा ऊपर के (संशोधित) निष्कर्ष, त्रुटि एवं निर्देश '
+                            'सहित।</div>')
+                    mark_draft = gr.Checkbox(label="रिपोर्ट के अंत में 'AI सहायता से तैयार' टिप्पणी जोड़ें", value=True)
+                    with gr.Row():
+                        to_word = gr.Button("Word (.docx)", elem_classes=["sn-dl", "sn-word"])
+                        to_pdf = gr.Button("PDF", elem_classes=["sn-dl", "sn-pdf"])
+                    report_status = gr.Markdown("")
+                    report_file = gr.File(label="रिपोर्ट", interactive=False, height=90)
         inputs = [kruti] + [boxes[key] for key, *_ in ALL_FIELDS]
         outputs = [boxes[key] for key, *_ in ALL_FIELDS] + [conclusion, lapses, directions, status]
         go.click(draft, inputs=inputs, outputs=outputs)
+        export_inputs = [kruti, mark_draft, conclusion, lapses, directions] + [boxes[key] for key, *_ in ALL_FIELDS]
+        to_word.click(lambda *a: export("docx", *a), inputs=export_inputs, outputs=[report_file, report_status])
+        to_pdf.click(lambda *a: export("pdf", *a), inputs=export_inputs, outputs=[report_file, report_status])
     return app
+
+
+# Each input section gets its own colour; the output boxes get stronger ones.
+SECTION_COLOURS = {"fir": "fir", "place": "place", "pros_ev": "pros", "witnesses": "wit", "progress": "prog",
+                   "arrest": "misc", "surrender": "misc", "seizure": "misc", "defence": "misc"}
+_CARDS = {  # class: (border, tint)
+    "case": ("#2563eb", "#eff6ff"), "header": ("#0d9488", "#f0fdfa"), "fir": ("#7c3aed", "#f5f3ff"),
+    "place": ("#16a34a", "#f0fdf4"), "pros": ("#ea580c", "#fff7ed"), "wit": ("#db2777", "#fdf2f8"),
+    "prog": ("#0891b2", "#ecfeff"), "misc": ("#64748b", "#f8fafc"),
+    "out1": ("#15803d", "#f0fdf4"), "out2": ("#b45309", "#fffbeb"), "out3": ("#1d4ed8", "#eff6ff"),
+    "report": ("#9333ea", "#faf5ff"),
+}
+CSS = """
+body, .gradio-container, .main, .wrap, .contain { background: #ffffff !important; }
+.gradio-container { max-width: 1400px !important; font-family: 'Noto Sans Devanagari', 'Nirmala UI', 'Mangal', sans-serif; }
+.sn-banner { background: linear-gradient(120deg, #1e3a8a, #7c3aed 55%, #db2777); color: #fff; border-radius: 16px;
+             padding: 22px 26px; margin-bottom: 8px; box-shadow: 0 6px 18px rgba(30,58,138,.25); }
+.sn-banner, .sn-banner * { color: #ffffff !important; }
+.sn-title { font-size: 1.9rem; font-weight: 800; letter-spacing: .2px; }
+.sn-sub { margin-top: 6px; font-size: 1.02rem; opacity: .95; line-height: 1.6; }
+.sn-col-head { font-size: 1.15rem; font-weight: 800; padding: 8px 14px; border-radius: 10px; margin: 6px 0 4px; }
+.sn-col-in  { color: #1e3a8a; background: #e0e7ff; border-left: 8px solid #1e3a8a; }
+.sn-col-out { color: #14532d; background: #dcfce7; border-left: 8px solid #15803d; }
+.sn-card { border-radius: 14px !important; margin: 8px 0 !important; padding: 10px 12px !important;
+           box-shadow: 0 2px 8px rgba(15,23,42,.06) !important; }
+.sn-card textarea, .sn-card input[type=text] { background: #ffffff !important; border: 1px solid #cbd5e1 !important;
+           border-radius: 8px !important; font-size: 1.02rem !important; line-height: 1.6 !important; color: #0f172a !important; }
+.sn-card span[data-testid="block-info"], .sn-card .label-wrap span, .sn-card button.label-wrap {
+           font-weight: 800 !important; font-size: 1.05rem !important; }
+.sn-check { border: 2px dashed #94a3b8 !important; border-radius: 12px !important; background: #f8fafc !important; }
+.sn-go button, button.sn-go { background: linear-gradient(90deg, #2563eb, #7c3aed) !important; color: #fff !important;
+           font-size: 1.15rem !important; font-weight: 800 !important; border: none !important; border-radius: 12px !important;
+           padding: 14px !important; box-shadow: 0 4px 14px rgba(124,58,237,.35) !important; }
+.sn-status { font-size: 1rem; padding: 4px 6px; }
+.sn-report-head { font-weight: 800; font-size: 1.1rem; color: #6b21a8; }
+.sn-report-sub { font-size: .95rem; color: #475569; margin-bottom: 6px; }
+button.sn-dl { font-weight: 800 !important; font-size: 1.05rem !important; color: #fff !important; border: none !important;
+           border-radius: 10px !important; padding: 10px !important; }
+button.sn-word { background: #2563eb !important; }
+button.sn-pdf  { background: #dc2626 !important; }
+""" + "".join(
+    f".c-{k} {{ border: 4px solid {b} !important; background: {t} !important; }}\n"
+    f".c-{k} span[data-testid='block-info'], .c-{k} .label-wrap span {{ color: {b} !important; }}\n"
+    for k, (b, t) in _CARDS.items())
+# Always open in the light theme, whatever the browser's dark-mode setting.
+FORCE_LIGHT = """() => { const u = new URL(window.location.href);
+  if (u.searchParams.get('__theme') !== 'light') { u.searchParams.set('__theme', 'light'); window.location.replace(u.href); } }"""
 
 
 def main():
@@ -356,11 +441,19 @@ def main():
         drafter = Drafter(args.base, args.adapter, args.max_new_tokens, args.device)
         limit = 1
         print(f"model loaded in {time.time() - t:.0f}s", flush=True)
+    import gradio as gr
     app = make_app(drafter)
     app.queue(default_concurrency_limit=limit, max_size=30)
+    theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="pink", neutral_hue="slate")
+    style = {"css": CSS, "theme": theme, "js": FORCE_LIGHT}
+    launch_params = inspect.signature(app.launch).parameters
+    if "css" not in launch_params:          # older Gradio takes styling on Blocks instead of launch()
+        for k, val in style.items():
+            setattr(app, k, val)
+        style = {}
     app.launch(server_name=args.host, server_port=args.port, root_path=args.root_path or None,
                auth=None if args.no_login else check_login, auth_message="पर्यवेक्षण टिप्पणी – मसौदा सहायक",
-               share=False, show_error=False)
+               share=False, show_error=False, **style)
 
 
 if __name__ == "__main__":

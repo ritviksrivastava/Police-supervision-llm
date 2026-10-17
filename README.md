@@ -15,7 +15,7 @@ they should not be added: the source documents are real case records that name c
 | 4 | `04_build_report2_pairs.py` | Supervision note → Report-2 training set (matched case by case) |
 | 5 | `05_train.py` | LoRA fine-tuning |
 | 6 | `06_evaluate.py` | Generation on the test set, metrics, side-by-side HTML report |
-| 7 | `07_webui.py` | Drafting console: operators type the case facts, the model drafts the conclusion, lapses and directions |
+| 7 | `07_webui.py` (+ `report.py`) | Drafting console: operators type the case facts, the model drafts the conclusion, lapses and directions; the full note can be downloaded as Word or PDF |
 | 8 | `08_merge_adapter.py` | Fold the LoRA adapter into a full checkpoint (for vLLM serving) |
 
 `schema.json` describes the structured record the notes are parsed into.
@@ -235,8 +235,16 @@ streaming as it goes.
   fields), and the converted text is written back into the form for checking.
 - The loop guard runs during generation; the operator is told when it fired, because the directions may then be
   incomplete.
+- **Report export** (`report.py`): the complete note – every input section plus the (edited) conclusion, lapses and
+  directions, numbered as in a real note – as a Word file or a PDF, with an optional closing line saying it was
+  prepared with AI assistance. Word files are written with `python-docx` (complex-script font settings so Word
+  draws Devanagari correctly); PDFs are produced by converting that file with LibreOffice, which shapes Devanagari
+  conjuncts properly. Text copied *out of* the PDF is unreliable (a known limitation of Devanagari in PDF text layers);
+  use the Word file for copying.
 - Logins are required (salted scrypt hashes in `webui_users.json`, which is git-ignored). Nothing typed into the form is
-  written to disk or logged – only timings.
+  logged – only timings. A report someone downloads is written to a private temporary folder and deleted after about
+  15 minutes.
+- Styling: light theme forced, a colour per section, thick borders; all in the `CSS` string in `07_webui.py`.
 
 ```
 python 07_webui.py add-user <name>                                         # asks for the password
@@ -257,6 +265,12 @@ VLLM_NO_USAGE_STATS=1 vllm serve ../runs/qwen35-4b-sn/merged --host 127.0.0.1 --
 
 `--gpu-memory-utilization` is a share of the whole GPU memory; keep it low on a machine whose memory is shared with
 other work.
+
+**Send token ids, not text, to vLLM.** vLLM's own tokeniser split the Hindi prompts into about 50% more tokens than
+the tokeniser used in training, and the model then dropped letters and misspelled words. The console therefore
+tokenises the prompt itself and sends the ids; with that, vLLM's greedy output matches `transformers` exactly.
+Measured with a training job sharing the GPU: about 10 tokens/s per user with one user and 8.8 tokens/s each with ten
+(79 tokens/s in total).
 
 **Access.** The console listens on `127.0.0.1` only. It is reached through a private overlay network (Tailscale
 `serve`, tailnet only – not `funnel`), with an access rule that lets operators reach the console's HTTPS port and

@@ -7,3 +7,9 @@ accelerate
 # flash-linear-attention
 # causal-conv1d   (pip install --no-build-isolation causal-conv1d)
 # bitsandbytes    (only for --load-4bit)
+# drafting console (07_webui.py, report.py)
+gradio
+requests
+python-docx
+# PDF export also needs LibreOffice (soffice) and a Devanagari font on the server
+# multi-user serving: vllm (in its own environment) - see README section 4
