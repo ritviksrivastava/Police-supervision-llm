@@ -28,6 +28,8 @@ def parse_args():
     p.add_argument("--max-new-tokens", type=int, default=4096)
     p.add_argument("--batch", type=int, default=4)
     p.add_argument("--repetition-penalty", type=float, default=1.0)
+    p.add_argument("--stop-on-repeat", action="store_true",
+                   help="end an answer once it has repeated three earlier lines (a loop), and drop repeated lines")
     p.add_argument("--load-4bit", action="store_true")
     p.add_argument("--score-only", action="store_true")
     return p.parse_args()
@@ -35,9 +37,46 @@ def parse_args():
 
 # ---------------------------------------------------------------- generation
 
+_LINE_NUM = re.compile(r"^\s*\d{1,2}\s*[.)]\s*")
+
+
+LOOP_REPEATS = 3   # this many repeated lines means the model is looping, not just restating one direction
+
+
+def drop_repeated_lines(text, min_len=20):
+    """Return (text without lines that repeat an earlier line, number of lines dropped). Numbering is ignored."""
+    seen, kept, dropped = set(), [], 0
+    for line in text.split("\n"):
+        key = re.sub(r"\s+", " ", _LINE_NUM.sub("", line)).strip()
+        if len(key) >= min_len:
+            if key in seen:
+                dropped += 1
+                continue
+            seen.add(key)
+        kept.append(line)
+    return "\n".join(kept), dropped
+
+
 def generate(args, cases, pred_path):
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+
+    class StopOnRepeat(StoppingCriteria):
+        """Marks a sequence finished once its newly generated text contains a repeated line."""
+
+        def __init__(self, tok, prompt_len, every=16):
+            self.tok, self.prompt_len, self.every, self.calls = tok, prompt_len, every, 0
+
+        def __call__(self, input_ids, scores, **kwargs):
+            done = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+            self.calls += 1
+            if self.calls % self.every:
+                return done
+            for i, row in enumerate(input_ids):
+                text = self.tok.decode(row[self.prompt_len:], skip_special_tokens=True)
+                # only complete lines count: the last one may still be being written
+                done[i] = drop_repeated_lines(text.rsplit("\n", 1)[0])[1] >= LOOP_REPEATS
+            return done
 
     done = set()
     if os.path.exists(pred_path):
@@ -82,15 +121,26 @@ def generate(args, cases, pred_path):
             batch = todo[i:i + args.batch]
             enc = tok([prompts[c["id"]][0] for c in batch], return_tensors="pt", padding=True,
                       add_special_tokens=False).to(model.device)
+            stops = (StoppingCriteriaList([StopOnRepeat(tok, enc["input_ids"].shape[1])])
+                     if args.stop_on_repeat else None)
             with torch.no_grad():
                 out = model.generate(**enc, max_new_tokens=args.max_new_tokens, do_sample=False,
-                                     repetition_penalty=args.repetition_penalty, pad_token_id=tok.pad_token_id)
+                                     repetition_penalty=args.repetition_penalty, pad_token_id=tok.pad_token_id,
+                                     stopping_criteria=stops)
             for c, seq in zip(batch, out):
                 new = seq[enc["input_ids"].shape[1]:]
-                n_new += int((new != tok.pad_token_id).sum())
+                n_tokens = int((new != tok.pad_token_id).sum())
+                n_new += n_tokens
+                text = tok.decode(new, skip_special_tokens=True)
+                looped = False
+                if args.stop_on_repeat:
+                    if tok.eos_token_id not in new.tolist():   # stopped early or cut off: last line is unfinished
+                        text = text.rsplit("\n", 1)[0]
+                    text, dropped = drop_repeated_lines(text)
+                    looped = dropped >= LOOP_REPEATS
                 f.write(json.dumps({"id": c["id"], "source_file": c.get("source_file", c.get("report_file")),
-                                    "prediction": tok.decode(new, skip_special_tokens=True).strip(),
-                                    "hit_token_limit": len(new) >= args.max_new_tokens and tok.eos_token_id not in new},
+                                    "prediction": text.strip(), "stopped_on_repeat": looped,
+                                    "hit_token_limit": not looped and n_tokens >= args.max_new_tokens},
                                    ensure_ascii=False) + "\n")
             f.flush()
             elapsed = time.time() - start
@@ -210,6 +260,7 @@ def summarise(rows):
         "ungrounded_fact_share": mean("ungrounded_fact_share"),
         "length_ratio": mean("length_ratio"),
         "hit_token_limit_share": round(sum(bool(r.get("hit_token_limit")) for r in rows) / len(rows), 3),
+        "stopped_on_repeat_share": round(sum(bool(r.get("stopped_on_repeat")) for r in rows) / len(rows), 3),
     }
 
 

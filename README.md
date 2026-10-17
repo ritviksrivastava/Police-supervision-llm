@@ -15,6 +15,8 @@ they should not be added: the source documents are real case records that name c
 | 4 | `04_build_report2_pairs.py` | Supervision note → Report-2 training set (matched case by case) |
 | 5 | `05_train.py` | LoRA fine-tuning |
 | 6 | `06_evaluate.py` | Generation on the test set, metrics, side-by-side HTML report |
+| 7 | `07_webui.py` | Drafting console: operators type the case facts, the model drafts the conclusion, lapses and directions |
+| 8 | `08_merge_adapter.py` | Fold the LoRA adapter into a full checkpoint (for vLLM serving) |
 
 `schema.json` describes the structured record the notes are parsed into.
 
@@ -176,8 +178,8 @@ Environment: Python 3.12, `torch 2.14.1+cu130`, `transformers 5.18.0`, `peft 0.2
   checkpoint in `--out`, this was enough to continue from step 600 after one reset, with about 15 minutes lost.
 - **`transformers` 5 changes** met along the way: `warmup_ratio` is no longer accepted (the script passes a step
   count), and models are loaded with `dtype=` rather than `torch_dtype=`.
-- **Progress so far.** Training loss fell from 0.58 to about 0.2 during the first 1.2 epochs; validation loss after
-  epoch 1 was 0.225. Final numbers and test-set evaluation are still to come.
+- **Result.** Validation loss 0.225 → 0.204 → 0.201 over the three epochs (most of the gain in epoch 2, no sign of
+  over-fitting); training loss ended near 0.18. About 28 hours of training in total.
 
 ### 3.3 Evaluation (`06_evaluate.py`)
 
@@ -200,7 +202,67 @@ by side, worst cases first).
 The last column is the floor produced by boilerplate and chance; a useful model has to be well above it. The scores
 measure closeness to one officer's wording, so the HTML report is for reading and the numbers are for comparing runs.
 
-## 4. Folder layout
+### 3.4 Results (Qwen 3.5 4B, 233 test cases)
+
+| Metric | Untuned base model | Fine-tuned | Fine-tuned + loop guard |
+|---|---|---|---|
+| Well-formed (all three parts) | 8% | 97% | 99% |
+| chrF, overall | 43 | 78 | 80 |
+| chrF, conclusion | 15 | 86 | 86 |
+| Directions covered | 0% | 58% | 58% |
+| Law sections F1 | 0.16 | 0.88 | 0.88 |
+| Verdict agreement | 28% | 91% | 92% |
+| Ungrounded fact share | 19% | 0.8% | 0.8% |
+| Ran to the token limit | 29% | 24% | 2% |
+
+- **Conclusions are reliable**: the right sections of law, the same finding as the officer in nine cases out of ten,
+  and almost no invented numbers, dates or vehicle numbers.
+- **Directions are the weak part.** In about a quarter of the cases greedy decoding fell into a loop, writing the same
+  direction again and again. `--stop-on-repeat` ends generation once three earlier lines have been repeated and drops
+  the repeats; that removes the junk (output length back to 1.0× the officer's) but does not add the missing
+  directions – on those cases the model writes about 5 distinct directions where the officer wrote about 9.
+
+## 4. Drafting console (`07_webui.py`)
+
+A Gradio web page in Hindi. The operator fills in the case details and the sections that were the model's input
+during training (प्राथमिकी, घटनास्थल, अभियोजन साक्ष्य, साक्षी, अनुसंधान में प्रगति, गिरफ्तारी, समर्पण,
+तलाशी सह जप्ती, प्रतिरक्षा साक्ष्य); the model writes **निष्कर्ष**, **त्रुटि** and **निर्देश** into editable boxes,
+streaming as it goes.
+
+- The fields are laid out the way supervision notes are written, so the prompt matches the training format; empty
+  arrest / seizure / defence fields become "शून्य।" as in real notes.
+- Text typed or pasted in **Kruti Dev** is converted to Unicode automatically (a checkbox forces it for very short
+  fields), and the converted text is written back into the form for checking.
+- The loop guard runs during generation; the operator is told when it fired, because the directions may then be
+  incomplete.
+- Logins are required (salted scrypt hashes in `webui_users.json`, which is git-ignored). Nothing typed into the form is
+  written to disk or logged – only timings.
+
+```
+python 07_webui.py add-user <name>                                         # asks for the password
+python 07_webui.py serve --adapter ../runs/qwen35-4b-sn/final              # one draft at a time (transformers)
+python 08_merge_adapter.py --adapter ../runs/qwen35-4b-sn/final --out ../runs/qwen35-4b-sn/merged
+python 07_webui.py serve --adapter ../runs/qwen35-4b-sn/merged --vllm-url http://127.0.0.1:8000   # several users
+```
+
+**Serving several users.** With plain `transformers` each draft takes the GPU to itself (roughly one to several
+minutes per draft), so simultaneous users queue. For 5–10 concurrent users the console can send generation to a
+**vLLM** server, which batches requests on the GPU; the loop guard then works by closing the stream, which makes
+vLLM drop the request. Serve the merged checkpoint locally, e.g.
+
+```
+VLLM_NO_USAGE_STATS=1 vllm serve ../runs/qwen35-4b-sn/merged --host 127.0.0.1 --port 8000 \
+  --gpu-memory-utilization 0.25 --max-model-len 20480 --max-num-seqs 10 --limit-mm-per-prompt '{"image": 0, "video": 0}'
+```
+
+`--gpu-memory-utilization` is a share of the whole GPU memory; keep it low on a machine whose memory is shared with
+other work.
+
+**Access.** The console listens on `127.0.0.1` only. It is reached through a private overlay network (Tailscale
+`serve`, tailnet only – not `funnel`), with an access rule that lets operators reach the console's HTTPS port and
+nothing else on the machine.
+
+## 5. Folder layout
 
 ```
 <project>/
@@ -210,11 +272,11 @@ measure closeness to one officer's wording, so the HTML report is for reading an
   dataset/supervision/  records.jsonl, train/val/test.jsonl, stats.json
   dataset/report2/      records.jsonl
   dataset/sn_to_report2/ train/val/test.jsonl, match_audit.csv, stats.json
-  runs/                 checkpoints, adapters, evaluation output
+  runs/                 checkpoints, adapters, merged model, evaluation output
   sn_pipeline/          this repository
 ```
 
-## 5. Known limits
+## 6. Known limits
 
 - Scanned PDFs are not used.
 - Section splitting is rule-based; about 300 notes with unusual layouts are dropped rather than guessed at.

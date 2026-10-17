@@ -21,3 +21,6 @@ __pycache__/
 # machine-specific run wrappers (kept locally and on the training machine)
 run_when_free.sh
 resume_on_boot.sh
+
+# web UI logins (password hashes)
+webui_users.json
